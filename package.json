@@ -1,0 +1,6 @@
+{
+  "name": "thermostat-schedule-card",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": { "test": "node test/card.test.mjs" }
+}
