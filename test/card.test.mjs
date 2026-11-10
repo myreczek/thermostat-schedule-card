@@ -6,6 +6,13 @@ import assert from "node:assert/strict";
 const src = readFileSync(new URL("../thermostat-schedule-card.js", import.meta.url), "utf8");
 const registry = {};
 class FakeElement {
+  constructor() {
+    this.events = [];
+  }
+  dispatchEvent(e) {
+    this.events.push(e);
+  }
+  appendChild() {}
   attachShadow() {
     const listeners = {};
     this.shadowRoot = {
@@ -18,10 +25,21 @@ class FakeElement {
 const ctx = {
   HTMLElement: FakeElement,
   customElements: { define: (n, c) => (registry[n] = c) },
-  document: { createElement: () => ({ addEventListener() {} }) },
+  document: {
+    createElement: () => {
+      const f = { handlers: {} };
+      f.addEventListener = (t, fn) => (f.handlers[t] = fn);
+      return f;
+    },
+  },
   window: {},
   console: { info() {} },
-  CustomEvent: class {},
+  CustomEvent: class {
+    constructor(type, init) {
+      this.type = type;
+      this.detail = init.detail;
+    }
+  },
   Intl,
 };
 vm.createContext(ctx);
@@ -95,5 +113,80 @@ assert.ok(!c.shadowRoot.innerHTML.includes("<img src=x>"));
 // 7) config validation + stub config
 assert.throws(() => new Card().setConfig({}));
 assert.equal(JSON.stringify(Card.getStubConfig(mkHass())), JSON.stringify({ climate: "climate.t" }));
+
+// 8) after saving, the card keeps the saved plan even though the entity state is still the old one
+c = mk({ climate: "climate.t" }, mkHass("en"));
+click(c, { act: "open", i: "1" });
+click(c, { act: "temp", i: "1", d: "2" });
+click(c, { act: "dlg-ok" });
+click(c, { act: "save" });
+await new Promise((r) => setTimeout(r));
+assert.equal(c._blocks[1].temp, 22);
+assert.equal(c._dirty, false);
+
+// 9) invalid language tags do not break rendering and fall back to the HA language / English
+for (const language of ["c", "cs_CZ", "xx-", "auto"]) {
+  c = mk({ climate: "climate.t", language }, mkHass("en"));
+  assert.match(c.shadowRoot.innerHTML, /Mon–Fri|Po–Pá/, language);
+}
+assert.match(mk({ climate: "climate.t", language: "cs_CZ" }, mkHass("en")).shadowRoot.innerHTML, /Plán topení/);
+
+// 10) unavailable entities: message instead of a made-up plan, tabs still usable
+const down = Object.fromEntries(days.map((d) => [`text.t_weekly_schedule_${d}`, { state: "unavailable", attributes: {} }]));
+c = mk({ climate: "climate.t" }, mkHass("en", down));
+html = c.shadowRoot.innerHTML;
+assert.match(html, /Schedule entities unavailable/);
+assert.ok(!html.includes('data-act="add"') && !html.includes('data-act="save"'));
+assert.match(html, /data-act="tab"/);
+
+// 11) day tabs are locked while there are unsaved changes
+c = mk({ climate: "climate.t" }, mkHass("en"));
+click(c, { act: "open", i: "1" });
+click(c, { act: "temp", i: "1", d: "2" });
+click(c, { act: "dlg-ok" });
+assert.equal(c._dirty, true);
+assert.match(c.shadowRoot.innerHTML, /data-act="tab" data-i="1" disabled/);
+assert.match(c.shadowRoot.innerHTML, /Save or cancel your changes/);
+click(c, { act: "tab", i: "1" });
+assert.equal(c._tab, 0);
+assert.equal(c._dirty, true);
+click(c, { act: "cancel" });
+assert.ok(!/data-act="tab" data-i="1" disabled/.test(c.shadowRoot.innerHTML));
+click(c, { act: "tab", i: "1" });
+assert.equal(c._tab, 1);
+
+// 12) validation
+c = mk({ climate: "climate.t", max_blocks: 3 }, mkHass("en"));
+assert.match(c._validate(), /At most 3 blocks/);
+c._blocks = [{ start: 0, temp: 20 }, { start: 600, temp: 21 }, { start: 600, temp: 22 }];
+assert.match(c._validate(), /increasing/);
+c._blocks = [{ start: 60, temp: 20 }];
+assert.match(c._validate(), /00:00/);
+
+// 13) Escape closes the dialog and restores the plan
+c = mk({ climate: "climate.t" }, mkHass("en"));
+click(c, { act: "open", i: "1" });
+click(c, { act: "temp", i: "1", d: "2" });
+assert.ok(c._dlg);
+c.shadowRoot.fire("keydown", { key: "Escape", stopPropagation() {} });
+assert.equal(c._dlg, null);
+assert.equal(c._blocks[1].temp, 21);
+assert.equal(c._dirty, false);
+
+// 14) editor: config-changed drops empty values and "auto", converts time_step; schema stays stable
+const Editor = registry["thermostat-schedule-card-editor"];
+const ed = new Editor();
+ed.setConfig({ climate: "climate.t", title: "X", language: "cs" });
+ed.hass = mkHass("en");
+const form = ed._form;
+const schema = form.schema;
+assert.ok(schema.length > 0 && form.data.language === "cs");
+ed.hass = mkHass("en"); // another state update
+assert.equal(form.schema, schema, "schema not reassigned on hass updates");
+form.handlers["value-changed"]({
+  stopPropagation() {},
+  detail: { value: { climate: "climate.t", title: "", time_step: "30", language: "auto", min: 8 } },
+});
+assert.equal(JSON.stringify(ed.events[0].detail.config), JSON.stringify({ climate: "climate.t", time_step: 30, min: 8 }));
 
 console.log("ok");

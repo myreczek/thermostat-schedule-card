@@ -6,7 +6,7 @@
  * https://github.com/myreczek/thermostat-schedule-card
  */
 
-const VERSION = "1.0.0";
+const VERSION = "1.0.1";
 
 const DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
 const DAY = 24 * 60;
@@ -54,6 +54,8 @@ const STRINGS = {
     err_save: (m) => `Saving failed: ${m}`,
     missing: (list) => `Schedule entities not found: ${list}`,
     need_config: "Set climate or entity_prefix.",
+    unavailable: (list) => `Schedule entities unavailable: ${list}`,
+    save_first: "Save or cancel your changes before switching days.",
     ed_climate: "Thermostat (climate entity)",
     ed_title: "Title",
     ed_prefix: "Schedule entity prefix (autodetected from the thermostat when empty)",
@@ -67,7 +69,8 @@ const STRINGS = {
     ed_step: "Temperature step",
     ed_time_step: "Time step (minutes)",
     ed_max_blocks: "Maximum blocks per day",
-    ed_language: "Language (empty = follow Home Assistant)",
+    ed_language: "Language",
+    ed_auto: "Automatic (Home Assistant language)",
     ed_radar: "Presence detection switch",
     ed_sens: "Sensitivity select",
     ed_bri: "Brightness number",
@@ -114,6 +117,8 @@ const STRINGS = {
     err_save: (m) => `Uložení selhalo: ${m}`,
     missing: (list) => `Entity plánu nenalezeny: ${list}`,
     need_config: "Nastav climate nebo entity_prefix.",
+    unavailable: (list) => `Entity plánu nejsou dostupné: ${list}`,
+    save_first: "Před přepnutím dne změny ulož nebo zruš.",
     ed_climate: "Termostat (entita climate)",
     ed_title: "Název",
     ed_prefix: "Prefix entit plánu (při prázdném se odvodí z termostatu)",
@@ -127,7 +132,8 @@ const STRINGS = {
     ed_step: "Krok teploty",
     ed_time_step: "Krok času (minuty)",
     ed_max_blocks: "Nejvíce bloků za den",
-    ed_language: "Jazyk (prázdné = podle Home Assistantu)",
+    ed_language: "Jazyk",
+    ed_auto: "Automaticky (jazyk Home Assistantu)",
     ed_radar: "Přepínač detekce přítomnosti",
     ed_sens: "Výběr citlivosti",
     ed_bri: "Číslo jasu",
@@ -139,10 +145,19 @@ const SENS_LABELS = {
   cs: { low: "Nízká", medium: "Střední", high: "Vysoká" },
 };
 
-const langOf = (hass, cfg) =>
-  String(cfg?.language || hass?.locale?.language || hass?.language || "en")
-    .toLowerCase()
-    .split("-")[0];
+// first valid language tag wins; an invalid one (typo in the config) must not break rendering
+const langOf = (hass, cfg) => {
+  for (const cand of [cfg?.language, hass?.locale?.language, hass?.language]) {
+    if (!cand || cand === "auto") continue;
+    try {
+      const tag = Intl.getCanonicalLocales(String(cand).replace("_", "-"))[0];
+      if (tag) return tag.split("-")[0].toLowerCase();
+    } catch {
+      // invalid tag, try the next candidate
+    }
+  }
+  return "en";
+};
 
 const makeT = (lang) => (key, ...args) => {
   const v = (STRINGS[lang] || STRINGS.en)[key] ?? STRINGS.en[key] ?? key;
@@ -252,6 +267,7 @@ class ThermostatScheduleCard extends HTMLElement {
       this.attachShadow({ mode: "open" });
       this.shadowRoot.addEventListener("click", (e) => this._onClick(e));
       this.shadowRoot.addEventListener("change", (e) => this._onChange(e));
+      this.shadowRoot.addEventListener("keydown", (e) => this._onKey(e));
     }
     if (this._hass) this.hass = this._hass;
   }
@@ -310,8 +326,13 @@ class ThermostatScheduleCard extends HTMLElement {
     return this._hass.states[this._entityId(day)];
   }
 
-  _missing() {
-    return this._groups[this._tab].days.map((d) => this._entityId(d)).filter((id) => !this._hass.states[id]);
+  // message about the active group's entities (missing / unavailable), "" when all is well
+  _problem() {
+    const ids = this._groups[this._tab].days.map((d) => this._entityId(d));
+    const missing = ids.filter((id) => !this._hass.states[id]);
+    if (missing.length) return this._t("missing", missing.join(", "));
+    const down = ids.filter((id) => ["unavailable", "unknown"].includes(this._hass.states[id].state));
+    return down.length ? this._t("unavailable", down.join(", ")) : "";
   }
 
   _load() {
@@ -341,7 +362,8 @@ class ThermostatScheduleCard extends HTMLElement {
           value,
         });
       this._dirty = false;
-      this._load();
+      this._differs = false;
+      // no _load() here: the entity states still hold the old plan, the update from HA triggers the reload
     } catch (e) {
       this._error = this._t("err_save", e.message || e);
     }
@@ -398,8 +420,8 @@ class ThermostatScheduleCard extends HTMLElement {
     const i = Number(el.dataset.i);
     const { min, max, step, time_step: ts } = this._cfg;
     if (act === "tab") {
+      if (this._dirty) return; // unsaved changes: save or cancel first
       this._tab = i;
-      this._dirty = false;
       this._error = "";
       this._load();
       this._render();
@@ -470,15 +492,7 @@ class ThermostatScheduleCard extends HTMLElement {
       this._render();
     } else if (act === "dlg-cancel" || act === "dlg-bg") {
       if (act === "dlg-bg" && ev.target !== el) return; // a tap inside the dialog itself does not close it
-      if (this._settings) {
-        this._settings = false;
-        this._render();
-        return;
-      }
-      this._blocks = this._dlg.snap;
-      this._dirty = this._dlg.dirtyBefore;
-      this._dlg = null;
-      this._render();
+      this._cancelOverlay();
     } else if (act === "save") this._save();
     else if (act === "cancel") {
       this._dirty = false;
@@ -486,6 +500,36 @@ class ThermostatScheduleCard extends HTMLElement {
       this._load();
       this._render();
     }
+  }
+
+  _cancelOverlay() {
+    if (this._settings) {
+      this._settings = false;
+    } else if (this._dlg) {
+      this._blocks = this._dlg.snap;
+      this._dirty = this._dlg.dirtyBefore;
+      this._dlg = null;
+    }
+    this._render();
+  }
+
+  _onKey(ev) {
+    if (ev.key === "Escape" && (this._dlg || this._settings)) {
+      ev.stopPropagation();
+      this._cancelOverlay();
+    } else if ((ev.key === "Enter" || ev.key === " ") && ev.target.matches?.(".seg")) {
+      ev.preventDefault();
+      this._onClick({ target: ev.target });
+    }
+  }
+
+  // the card is redrawn with innerHTML, so keyboard focus has to be put back by hand
+  _focusKey() {
+    const d = this.shadowRoot.activeElement?.dataset;
+    if (!d) return null;
+    if (d.sel) return `select[data-sel="${d.sel}"]`;
+    if (!d.act) return null;
+    return `[data-act="${d.act}"]${d.i !== undefined ? `[data-i="${d.i}"]` : ""}${d.d !== undefined ? `[data-d="${d.d}"]` : ""}`;
   }
 
   _dialogHtml() {
@@ -501,7 +545,7 @@ class ThermostatScheduleCard extends HTMLElement {
     const stepTxt = fmtTemp(step, lang);
     return `
       <div class="overlay" data-act="dlg-bg">
-        <div class="dialog">
+        <div class="dialog" role="dialog" aria-modal="true" tabindex="-1">
           <h3>${d.isNew ? t("new_block") : t("edit_block")}</h3>
           <div class="field">
             <div class="cap">${t("start")}</div>
@@ -555,7 +599,7 @@ class ThermostatScheduleCard extends HTMLElement {
     const sensOpts = sens ? (sens.attributes.options || ["low", "medium", "high"]).map((o) => [o, sensLabels[o] || o]) : [];
     return `
       <div class="overlay" data-act="dlg-bg">
-        <div class="dialog">
+        <div class="dialog" role="dialog" aria-modal="true" tabindex="-1">
           <h3>${t("settings_title")}</h3>
           ${
             rad
@@ -596,14 +640,8 @@ class ThermostatScheduleCard extends HTMLElement {
     const lang = this._lang;
     const cfg = this._cfg;
     const title = esc(cfg.title ?? t("default_title"));
-    const missing = this._missing();
-    if (missing.length) {
-      this.shadowRoot.innerHTML = `
-        <style>ha-card { padding: 16px; } h2 { margin: 0 0 8px; font-size: 1.3em; font-weight: 500; }
-               .err { color: var(--error-color); }</style>
-        <ha-card><h2>${title}</h2><div class="err">${esc(t("missing", missing.join(", ")))}</div></ha-card>`;
-      return;
-    }
+    const problem = this._problem();
+    const keep = this._focusKey();
     const clim = cfg.climate && this._hass.states[cfg.climate];
     const b = this._blocks;
     const full = b.length >= cfg.max_blocks;
@@ -620,7 +658,7 @@ class ThermostatScheduleCard extends HTMLElement {
         ? `<div class="tabs">${this._groups
             .map(
               (g, i) =>
-                `<button class="tab ${i === this._tab ? "on" : ""}" data-act="tab" data-i="${i}">${esc(this._groupLabel(g))}</button>`
+                `<button class="tab ${i === this._tab ? "on" : ""}" data-act="tab" data-i="${i}" ${this._dirty ? "disabled" : ""}>${esc(this._groupLabel(g))}</button>`
             )
             .join("")}</div>`
         : "";
@@ -628,7 +666,7 @@ class ThermostatScheduleCard extends HTMLElement {
     const bar = b
       .map((blk, i) => {
         const w = ((this._end(i) - blk.start) / DAY) * 100;
-        return `<div class="seg" role="button" data-act="open" data-i="${i}" title="${fmtTime(blk.start)} – ${fmtEnd(this._end(i))}" style="width:${w}%;background:${col(blk.temp)}">${w >= 6 ? fmtTemp(blk.temp, lang) : ""}</div>`;
+        return `<div class="seg" role="button" tabindex="0" data-act="open" data-i="${i}" title="${fmtTime(blk.start)} – ${fmtEnd(this._end(i))}" aria-label="${fmtTime(blk.start)} – ${fmtEnd(this._end(i))}, ${fmtTemp(blk.temp, lang)} °C" style="width:${w}%;background:${col(blk.temp)}">${w >= 6 ? fmtTemp(blk.temp, lang) : ""}</div>`;
       })
       .join("");
     const rows = b
@@ -721,6 +759,9 @@ class ThermostatScheduleCard extends HTMLElement {
         .save { background: var(--primary-color); color: var(--card-background-color, #fff); font-weight: 500; }
         .danger { color: var(--error-color); }
         button:disabled { opacity: .3; cursor: default; }
+        .tab.on:disabled { opacity: 1; }
+        .hint { margin: -8px 0 12px; }
+        .dialog:focus { outline: none; }
         .warn { color: var(--warning-color, orange); margin: 8px 0; }
         .err { color: var(--error-color); margin: 8px 0; }
         .overlay { position: absolute; inset: -16px; z-index: 5; display: flex; align-items: flex-start;
@@ -753,7 +794,11 @@ class ThermostatScheduleCard extends HTMLElement {
         <div class="sub">${sub}</div>
         ${clim ? `<div class="tabs">${modes}</div>` : ""}
         ${clim && clim.state !== "auto" ? `<div class="warn">${t("not_auto")}</div>` : ""}
-        ${tabs}
+        ${tabs}${tabs && this._dirty ? `<div class="note hint">${t("save_first")}</div>` : ""}
+        ${
+          problem
+            ? `<div class="err">${esc(problem)}</div>`
+            : `
         ${this._differs && !this._dirty ? `<div class="warn">${t("differs")}</div>` : ""}
         <div class="bar">${bar}</div>
         <div class="axis"><span>0</span><span>6</span><span>12</span><span>18</span><span>24</span></div>
@@ -765,22 +810,55 @@ class ThermostatScheduleCard extends HTMLElement {
         <div class="actions">
           <button data-act="cancel" ${this._dirty ? "" : "disabled"}>${t("cancel")}</button>
           <button class="save" data-act="save" ${this._dirty ? "" : "disabled"}>${t("save")}</button>
-        </div>
+        </div>`
+        }
         ${this._dlg ? this._dialogHtml() : ""}
         ${this._settings ? this._settingsHtml() : ""}
       </div></ha-card>`;
+    const root = this.shadowRoot;
+    const overlay = this._dlg || this._settings;
+    let target = keep && root.querySelector?.(keep);
+    if (!target && overlay && !this._overlayFocused) target = root.querySelector?.(".dialog");
+    this._overlayFocused = !!overlay;
+    target?.focus?.();
   }
 }
+
+const EDITOR_LABELS = {
+  climate: "ed_climate",
+  title: "ed_title",
+  entity_prefix: "ed_prefix",
+  grouping: "ed_grouping",
+  min: "ed_min",
+  max: "ed_max",
+  step: "ed_step",
+  time_step: "ed_time_step",
+  max_blocks: "ed_max_blocks",
+  language: "ed_language",
+  radar_entity: "ed_radar",
+  sensitivity_entity: "ed_sens",
+  brightness_entity: "ed_bri",
+};
 
 class ThermostatScheduleCardEditor extends HTMLElement {
   setConfig(config) {
     this._cfg = config;
+    this._data = this._toData(config);
     this._update();
   }
 
   set hass(hass) {
     this._hass = hass;
     this._update();
+  }
+
+  // ha-form selects work with strings; "auto" stands for "no language set"
+  _toData(cfg) {
+    return {
+      ...cfg,
+      time_step: cfg.time_step ? String(cfg.time_step) : undefined,
+      language: cfg.language || "auto",
+    };
   }
 
   _schema(t) {
@@ -819,7 +897,19 @@ class ThermostatScheduleCardEditor extends HTMLElement {
             },
           },
           { name: "max_blocks", selector: { number: { min: 2, max: 24, step: 1, mode: "box" } } },
-          { name: "language", selector: { text: {} } },
+          {
+            name: "language",
+            selector: {
+              select: {
+                mode: "dropdown",
+                options: [
+                  { value: "auto", label: t("ed_auto") },
+                  { value: "en", label: "English" },
+                  { value: "cs", label: "Čeština" },
+                ],
+              },
+            },
+          },
           { name: "radar_entity", selector: { entity: { domain: "switch" } } },
           { name: "sensitivity_entity", selector: { entity: { domain: "select" } } },
           { name: "brightness_entity", selector: { entity: { domain: "number" } } },
@@ -830,7 +920,6 @@ class ThermostatScheduleCardEditor extends HTMLElement {
 
   _update() {
     if (!this._cfg || !this._hass) return;
-    const t = makeT(langOf(this._hass, this._cfg));
     if (!this._form) {
       this._form = document.createElement("ha-form");
       this._form.addEventListener("value-changed", (ev) => {
@@ -838,32 +927,26 @@ class ThermostatScheduleCardEditor extends HTMLElement {
         const config = {};
         for (const [k, v] of Object.entries(ev.detail.value)) {
           if (v === "" || v === undefined || v === null) continue;
+          if (k === "language" && v === "auto") continue;
           config[k] = k === "time_step" ? Number(v) : v;
         }
         this._cfg = config;
+        this._data = this._toData(config);
         this.dispatchEvent(new CustomEvent("config-changed", { detail: { config }, bubbles: true, composed: true }));
       });
       this.appendChild(this._form);
     }
-    const labels = {
-      climate: "ed_climate",
-      title: "ed_title",
-      entity_prefix: "ed_prefix",
-      grouping: "ed_grouping",
-      min: "ed_min",
-      max: "ed_max",
-      step: "ed_step",
-      time_step: "ed_time_step",
-      max_blocks: "ed_max_blocks",
-      language: "ed_language",
-      radar_entity: "ed_radar",
-      sensitivity_entity: "ed_sens",
-      brightness_entity: "ed_bri",
-    };
     this._form.hass = this._hass;
-    this._form.data = { ...this._cfg, time_step: this._cfg.time_step ? String(this._cfg.time_step) : undefined };
-    this._form.schema = this._schema(t);
-    this._form.computeLabel = (s) => (labels[s.name] ? t(labels[s.name]) : s.name);
+    this._form.data = this._data;
+    // hass arrives on every state change in HA; assign the schema only when it really changes,
+    // otherwise ha-form redraws (and may drop focus) while the user is typing
+    const lang = langOf(this._hass, this._cfg);
+    if (this._schemaLang !== lang) {
+      this._schemaLang = lang;
+      const t = makeT(lang);
+      this._form.schema = this._schema(t);
+      this._form.computeLabel = (s) => (EDITOR_LABELS[s.name] ? t(EDITOR_LABELS[s.name]) : s.name);
+    }
   }
 }
 

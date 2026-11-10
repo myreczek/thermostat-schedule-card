@@ -58,12 +58,20 @@ The schedule entities are derived from the climate entity (`climate.foo` → `te
 | `time_step` | `15` | Time step in minutes (divisor of 60) |
 | `max_blocks` | `12` | Maximum blocks per day (device limit) |
 | `cold` / `warm` | `16` / `24` | Temperatures at the ends of the blue → orange colour scale |
-| `language` | Home Assistant language | `en` or `cs` |
+| `language` | Home Assistant language | `en` or `cs`; anything else falls back to English |
 | `radar_entity` | `switch.<climate>_radar_detection` | WGZBA presence detection switch |
 | `sensitivity_entity` | `select.<climate>_radar_sensitivity` | WGZBA radar sensitivity |
 | `brightness_entity` | `number.<climate>_active_brightness` | WGZBA active display brightness |
 
 The *Settings* button appears only when at least one of the radar entities exists.
+
+## Behaviour and limitations
+
+- Day tabs are locked while there are unsaved changes – save or cancel first.
+- If a schedule entity is missing or `unavailable`, the card shows a message instead of the editor so a real plan cannot be overwritten by a placeholder.
+- Saving writes the day entities one by one. If a write fails halfway, the changes stay unsaved in the card – press *Save* again to write all days.
+- Temperatures are written in °C, exactly as the thermostat stores them. With Home Assistant set to °F the *now / target* values from the `climate` entity are in °F while the schedule is still in °C.
+- Keyboard: timeline segments are focusable (Enter / Space), Esc closes a dialog.
 
 ## Development
 
